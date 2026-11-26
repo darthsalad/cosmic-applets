@@ -59,12 +59,12 @@ case "${1:-}" in
         ver="$(system_version)"
         tag="epoch-$ver"
         git -C "$repo" fetch -q --depth 1 origin tag "$tag"
-        if [[ "$(git -C "$repo" describe --tags --abbrev=0 "$branch")" == "$tag" ]]; then
+        base="$(git -C "$repo" describe --tags --abbrev=0 "$branch")"
+        if [[ "$base" == "$tag" ]]; then
             echo "Patch already on $tag."
         else
-            patch="$(git -C "$repo" rev-parse "$branch")"
             git -C "$repo" switch -q --detach "$tag"
-            if ! git -C "$repo" cherry-pick "$patch"; then
+            if ! git -C "$repo" cherry-pick "$base..$branch"; then
                 echo "Patch conflicts with $tag. Resolve, then: git cherry-pick --continue &&" \
                     "git branch -f $branch HEAD && git switch $branch && $0 install" >&2
                 exit 1
