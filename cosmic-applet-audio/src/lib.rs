@@ -37,7 +37,7 @@ use mpris_subscription::{MprisRequest, MprisUpdate};
 use mpris2_zbus::player::PlaybackStatus;
 use std::{
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{self, AtomicU32},
     },
     time::{Duration, Instant},
@@ -71,6 +71,8 @@ pub struct Audio {
     applied_sink_volume: Arc<AtomicU32>,
     /// Used to deboune source volume updates.
     applied_source_volume: Arc<AtomicU32>,
+    /// Latest unsent volume per playback stream, used to debounce slider drags.
+    pending_playback_volumes: Arc<Mutex<Vec<(model::NodeId, u32)>>>,
     /// Max slider volume for the sink device, as determined by the amplification property.
     max_sink_volume: u32,
     /// Max slider volume for the source device, as determined by the amplification property.
@@ -121,6 +123,26 @@ impl Audio {
             "microphone-sensitivity-high-symbolic"
         }
     }
+
+    /// Send queued playback volumes after a short delay, coalescing slider drags.
+    /// If the client is busy, `ReattachClient` calls this again when it returns.
+    fn flush_playback_volumes(&mut self) -> app::Task<Message> {
+        if self.pending_playback_volumes.lock().unwrap().is_empty() {
+            return Task::none();
+        }
+        let Some(mut client) = self.audio_client.take() else {
+            return Task::none();
+        };
+        let pending = Arc::clone(&self.pending_playback_volumes);
+        cosmic::Task::future(async move {
+            tokio::time::sleep(Duration::from_millis(64)).await;
+            let batch = std::mem::take(&mut *pending.lock().unwrap());
+            for (node_id, volume) in batch {
+                _ = client.conn.set_node_volume(node_id, volume).await;
+            }
+            Message::ReattachClient(Arc::new(client)).into()
+        })
+    }
 }
 
 #[derive(Debug, PartialEq, Eq, Default)]
@@ -129,10 +151,12 @@ enum IsOpen {
     None,
     Output,
     Input,
+    Applications,
 }
 
 #[derive(Clone, Debug)]
 pub enum Message {
+    ApplicationsToggle,
     /// Connection to `com.system76.CosmicSettings`.
     Client(Arc<audio_client::Client>),
     CloseRequested(window::Id),
@@ -147,6 +171,7 @@ pub enum Message {
     Rectangle(RectangleUpdate<u32>),
     SetDefaultSink(usize),
     SetDefaultSource(usize),
+    SetPlaybackVolume(model::NodeId, u32),
     SetSinkVolume(u32),
     SetSinkVolumeScroll(u32),
     SetSourceVolume(u32),
@@ -157,6 +182,7 @@ pub enum Message {
     ToggleSinkMute,
     ToggleSourceMute,
     Token(TokenUpdate),
+    TogglePlaybackMute(model::NodeId),
 }
 
 // TODO
@@ -291,6 +317,7 @@ impl cosmic::Application for Audio {
                 model: model::Model::default(),
                 applied_sink_volume: Arc::default(),
                 applied_source_volume: Arc::default(),
+                pending_playback_volumes: Arc::default(),
                 audio_client: None,
                 config: AudioAppletConfig::default(),
                 is_open: IsOpen::default(),
@@ -330,6 +357,7 @@ impl cosmic::Application for Audio {
                 if let Some(client) = Arc::into_inner(client) {
                     self.audio_client = Some(client);
                 }
+                return self.flush_playback_volumes();
             }
             Message::Ignore => {}
             Message::TogglePopup => {
@@ -391,6 +419,41 @@ impl cosmic::Application for Audio {
                     IsOpen::None
                 } else {
                     IsOpen::Input
+                }
+            }
+            Message::ApplicationsToggle => {
+                self.is_open = if self.is_open == IsOpen::Applications {
+                    IsOpen::None
+                } else {
+                    IsOpen::Applications
+                }
+            }
+
+            Message::SetPlaybackVolume(node_id, volume) => {
+                let Some(playback) = self.model.playback_mut(node_id) else {
+                    return Task::none();
+                };
+                if playback.volume == volume {
+                    return Task::none();
+                }
+                playback.volume = volume;
+                {
+                    let mut pending = self.pending_playback_volumes.lock().unwrap();
+                    match pending.iter_mut().find(|(id, _)| *id == node_id) {
+                        Some(entry) => entry.1 = volume,
+                        None => pending.push((node_id, volume)),
+                    }
+                }
+                return self.flush_playback_volumes();
+            }
+
+            Message::TogglePlaybackMute(node_id) => {
+                if let Some(mute) = self.model.playback_mut(node_id).map(|p| !p.mute)
+                    && let Some(client) = self.audio_client.as_mut()
+                {
+                    futures::executor::block_on(async {
+                        _ = client.conn.set_node_mute(node_id, mute).await;
+                    });
                 }
             }
             Message::Subscription(message) => {
@@ -845,6 +908,10 @@ impl cosmic::Application for Audio {
             .align_x(Alignment::Start)
         };
 
+        if !self.model.playbacks.is_empty() {
+            audio_content = audio_content.push(self.applications_revealer());
+        }
+
         if let Some(s) = self.player_status.as_ref() {
             let mut elements = Vec::with_capacity(5);
 
@@ -950,6 +1017,87 @@ impl cosmic::Application for Audio {
     fn on_close_requested(&self, id: window::Id) -> Option<Message> {
         Some(Message::CloseRequested(id))
     }
+}
+
+/// Max per-application volume and its slider notch, matching COSMIC Settings.
+const MAX_PLAYBACK_VOLUME: u32 = 150;
+const PLAYBACK_BREAKPOINTS: &[u32] = &[100];
+
+impl Audio {
+    /// Collapsible list of per-application volume sliders.
+    fn applications_revealer(&self) -> widget::Column<'_, Message, crate::Theme, Renderer> {
+        let open = self.is_open == IsOpen::Applications;
+        let names = self
+            .model
+            .playbacks
+            .iter()
+            .map(|p| p.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let summary = if names.chars().count() > 32 {
+            let mut trunc = names.chars().take(30).collect::<String>();
+            trunc.push_str("...");
+            trunc
+        } else {
+            names
+        };
+
+        let head = revealer_head(
+            open,
+            fl!("applications"),
+            summary,
+            Message::ApplicationsToggle,
+        );
+        let mut col = column![head].width(Length::Fill);
+        if open {
+            for playback in &self.model.playbacks {
+                col = col.push(playback_row(playback));
+            }
+        }
+        col
+    }
+}
+
+fn playback_row(playback: &model::Playback) -> Element<'_, Message> {
+    let id = playback.id;
+
+    let (first, rest) = playback
+        .icons
+        .split_first()
+        .expect("playback icons always end with a fallback");
+    let mut app_icon = icon::from_name(first.as_str()).size(24);
+    app_icon.fallback = Some(icon::IconFallback::Names(
+        rest.iter().map(|n| n.clone().into()).collect(),
+    ));
+
+    let header = row![
+        container(app_icon.icon()).width(Length::Fixed(24.0)),
+        text::body(playback.name.as_str()).width(Length::Fill),
+    ]
+    .spacing(12)
+    .align_y(Alignment::Center);
+
+    let controls = row![
+        button::icon(icon::from_name(playback.icon_name()).size(16).symbolic(true))
+            .class(cosmic::theme::Button::Icon)
+            .icon_size(16)
+            .line_height(24)
+            .on_press(Message::TogglePlaybackMute(id)),
+        slider(0..=MAX_PLAYBACK_VOLUME, playback.volume, move |v| {
+            Message::SetPlaybackVolume(id, v)
+        })
+        .width(Length::FillPortion(5))
+        .breakpoints(PLAYBACK_BREAKPOINTS),
+        container(text(playback.volume.to_string()).size(14))
+            .width(Length::FillPortion(1))
+            .align_x(Alignment::End),
+    ]
+    .spacing(12)
+    .align_y(Alignment::Center);
+
+    padded_control(column![header, controls].spacing(4))
+        .padding([6, 24])
+        .into()
 }
 
 fn revealer<'a>(

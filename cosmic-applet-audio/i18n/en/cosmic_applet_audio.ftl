@@ -5,3 +5,4 @@ sound-settings = Sound Settings...
 disconnected = PulseAudio Disconnected
 no-device = No device selected
 unknown-artist = Unknown
+applications = Applications

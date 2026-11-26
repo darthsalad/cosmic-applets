@@ -19,6 +19,72 @@ pub struct Model {
     pub active_source: ActiveNode,
     pub default_sink: Option<NodeId>,
     pub default_source: Option<NodeId>,
+    /// Per-application playback streams, in order of appearance.
+    pub playbacks: Vec<Playback>,
+}
+
+/// An application's playback stream.
+#[derive(Debug, Clone)]
+pub struct Playback {
+    pub id: NodeId,
+    pub name: String,
+    /// Icon names to try, best first.
+    pub icons: Vec<String>,
+    pub volume: u32,
+    pub mute: bool,
+}
+
+impl Playback {
+    fn new(id: NodeId, info: audio_client::PlaybackInfo) -> Self {
+        let non_empty = |s: &Option<String>| {
+            s.as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+        };
+
+        let name = non_empty(&info.application_name)
+            .or_else(|| non_empty(&info.media_name))
+            .unwrap_or_else(|| info.node_name.clone());
+
+        let mut icons = Vec::with_capacity(5);
+        for candidate in [
+            non_empty(&info.icon_name),
+            non_empty(&info.application_id),
+            Some(name.to_lowercase()),
+            Some(info.node_name.to_lowercase()),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if !icons.contains(&candidate) {
+                icons.push(candidate);
+            }
+        }
+        icons.push("audio-x-generic-symbolic".to_owned());
+
+        Self {
+            id,
+            name,
+            icons,
+            volume: 0,
+            mute: false,
+        }
+    }
+
+    pub fn icon_name(&self) -> &'static str {
+        if self.mute || self.volume == 0 {
+            "audio-volume-muted-symbolic"
+        } else if self.volume < 33 {
+            "audio-volume-low-symbolic"
+        } else if self.volume < 66 {
+            "audio-volume-medium-symbolic"
+        } else if self.volume <= 100 {
+            "audio-volume-high-symbolic"
+        } else {
+            "audio-volume-overamplified-symbolic"
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -91,9 +157,39 @@ pub struct ActiveNode {
 }
 
 impl Model {
+    pub fn playback_mut(&mut self, node_id: NodeId) -> Option<&mut Playback> {
+        self.playbacks.iter_mut().find(|p| p.id == node_id)
+    }
+
     pub fn update(&mut self, event: audio_client::Event) {
         tracing::debug!(?event, "update");
         match event {
+            audio_client::Event::Playback(node_id, info) => {
+                let new = Playback::new(node_id, info);
+                if let Some(existing) = self.playback_mut(node_id) {
+                    existing.name = new.name;
+                    existing.icons = new.icons;
+                } else {
+                    self.playbacks.push(new);
+                }
+            }
+
+            audio_client::Event::NodeMute(node_id, mute)
+                if self.playbacks.iter().any(|p| p.id == node_id) =>
+            {
+                if let Some(p) = self.playback_mut(node_id) {
+                    p.mute = mute;
+                }
+            }
+
+            audio_client::Event::NodeVolume(node_id, volume, _)
+                if self.playbacks.iter().any(|p| p.id == node_id) =>
+            {
+                if let Some(p) = self.playback_mut(node_id) {
+                    p.volume = volume;
+                }
+            }
+
             audio_client::Event::NodeMute(node_id, mute) => {
                 if let Some(pos) = self.sinks.id.iter().position(|id| node_id == *id) {
                     self.sinks.mute[pos] = mute;
@@ -309,6 +405,7 @@ impl Model {
 
             audio_client::Event::RemoveNode(node_id) => {
                 self.node_devices.remove(node_id);
+                self.playbacks.retain(|p| p.id != node_id);
 
                 if !self.sinks.remove(node_id) {
                     self.sources.remove(node_id);
