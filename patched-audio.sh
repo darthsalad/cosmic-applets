@@ -58,7 +58,7 @@ case "${1:-}" in
     update)
         ver="$(system_version)"
         tag="epoch-$ver"
-        git -C "$repo" fetch -q --depth 1 origin tag "$tag"
+        git -C "$repo" fetch -q --depth 1 https://github.com/pop-os/cosmic-applets.git tag "$tag"
         base="$(git -C "$repo" describe --tags --abbrev=0 "$branch")"
         if [[ "$base" == "$tag" ]]; then
             echo "Patch already on $tag."
